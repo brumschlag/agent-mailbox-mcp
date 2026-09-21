@@ -1,0 +1,45 @@
+# Linchpin proof: does a kelos Task survive a multi-minute watch_updates block and resume on reply?
+# Mirrors interactive-review's Bedrock-gateway credential wiring; joins the mailbox via collab-bridge.
+apiVersion: kelos.dev/v1alpha2
+kind: Task
+metadata:
+  name: collab-probe-3
+  namespace: kelos-pilot
+spec:
+  type: claude-code
+  model: claude-sonnet-46
+  credentials: { type: none }
+  workspaceRef: { name: envoverrides-scratch }   # lightweight; the probe touches no repo
+  agentConfigRefs:
+    - { name: collab-bridge }
+  ttlSecondsAfterFinished: 3600
+  prompt: |
+    CONNECTIVITY + HUMAN-IN-THE-LOOP PROBE. Do NOT modify any repository files.
+    Use the `agent-mailbox` MCP tools, workspace "inpulse":
+    1. Call session_start.
+    2. Call ask_human with question "PROBE: what is 2+2? Reply with just the number.",
+       recipient_id "local-brian", timeout_ms 300000. This is a SINGLE BLOCKING call —
+       it holds until local-brian replies (or 5 minutes elapse). Do NOT poll or loop;
+       make the one ask_human call and wait for it to return.
+    3. If it returns answered=true, print exactly "GOT REPLY: <reply.body>" and finish.
+    4. If answered=false, print "NO REPLY (timeout)" and finish.
+    Report whether you received the reply and its content.
+  podOverrides:
+    nodeSelector:
+      kubernetes.io/arch: amd64
+    env:
+      - name: ANTHROPIC_BASE_URL
+        value: http://bedrock-gateway.honcho.svc.cluster.local
+      - name: ANTHROPIC_AUTH_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: honcho-gateway-key
+            key: gateway-api-key
+      - name: MAX_THINKING_TOKENS
+        value: "0"
+      # Allow ask_human to block past claude-code's 2-min auto-background default,
+      # which dropped the call at exactly 120s ("transport dropped mid-call").
+      - name: CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS
+        value: "900000"
+      - name: CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT
+        value: "900000"

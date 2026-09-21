@@ -1,0 +1,89 @@
+# kelos side of the live collaboration bridge.
+# - AgentConfig `collab-bridge`: mounts the mailbox as an MCP server + scripts the cadence.
+# - Session `inpulse-collab`: a persistent claude-code interlocutor, mirroring interactive-review's
+#   proven Bedrock-gateway credential wiring.
+# Secret `collab-bridge-headers` is created imperatively (see APPLY.md) — NOT committed here.
+#
+# ⚠ VERIFY BEFORE APPLY: the exact shape of mcpServers[].headersFrom.secretRef (whether the secret's
+#   data keys map to header names) against the installed kelos CRD. See APPLY.md step 0.
+---
+apiVersion: kelos.dev/v1alpha2
+kind: AgentConfig
+metadata:
+  name: collab-bridge
+  namespace: kelos-pilot
+spec:
+  agentsMD: |
+    # Live collaboration bridge — you have a local partner agent
+
+    You are collaborating IN REAL TIME with a LOCAL agent on Brian's machine, over the
+    `agent-mailbox` MCP tools. Treat it like a teammate sitting in the same room.
+
+    ## Task tracking lives in beads, NOT here
+    beads (`bd`) is the source of truth for tasks and backlog. Do NOT use the mailbox's
+    task tools as a second backlog — they will drift from beads. Use the mailbox ONLY for:
+    live messages, handoffs, presence, and advisory locks.
+
+    ## Session rhythm
+    1. Call `session_start` FIRST — see unread messages, active locks, and who is online.
+    2. `read_message` each unread item before you act on it.
+    3. Before editing any shared file or module, call `list_locks`, then `acquire_lock` on it.
+       Locks are ADVISORY — they tell your partner what you are touching; they do not lock files.
+       Release every lock you own when you are done with it.
+    4. During long work, call `heartbeat` so your partner knows you are still alive.
+    5. Post progress and questions with `send_message` / `reply_message`. When you need your
+       partner's input before proceeding, say so explicitly and check `inbox` before continuing.
+    6. Hand a well-scoped baton with `create_handoff` (acceptance criteria + artifacts).
+
+    Your mailbox workspace is `inpulse`. Keep all coordination in that workspace.
+  mcpServers:
+    - name: agent-mailbox
+      type: http
+      url: http://mailbox-mcp.kelos-pilot.svc.cluster.local:8080/mcp
+      headersFrom:
+        secretRef:
+          name: collab-bridge-headers    # data key `Authorization` = `Bearer <kelos-token>`  [VERIFY]
+---
+apiVersion: kelos.dev/v1alpha2
+kind: Session
+metadata:
+  name: inpulse-collab
+  namespace: kelos-pilot
+spec:
+  suspend: false
+  idlePolicy:
+    suspendAfterSeconds: 1800
+  initialBranch: inpulse-collab
+  initialPrompt: |
+    You are joining a live collaboration channel with a local partner agent.
+    Call `session_start` on the `agent-mailbox` MCP server, then wait for your partner's
+    first message and work the task together, following your collaboration-bridge rhythm.
+  volumeClaimTemplate:
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 10Gi
+    storageClassName: auto-ebs-gp3
+  worker:
+    type: claude-code
+    model: claude-sonnet-46
+    credentials:
+      type: none                          # creds come via podOverrides.env, like interactive-review
+    workspaceRef:
+      name: inpulse-write                 # write workspace so the kelos agent can actually collaborate on code
+    agentConfigRefs:
+      - name: inpulse-knowledge           # existing repo policy / CI-gate guidance
+      - name: collab-bridge               # + the mailbox tools & cadence
+    podOverrides:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      env:
+        - name: ANTHROPIC_BASE_URL
+          value: http://bedrock-gateway.honcho.svc.cluster.local
+        - name: ANTHROPIC_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: honcho-gateway-key
+              key: gateway-api-key
+        - name: MAX_THINKING_TOKENS
+          value: "0"

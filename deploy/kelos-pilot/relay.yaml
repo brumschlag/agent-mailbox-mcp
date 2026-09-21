@@ -1,0 +1,76 @@
+# Agent-mailbox MCP relay — pilot deployment (kelos-pilot ns, software-engineering EKS).
+# ClusterIP only: local reaches it via `kubectl port-forward`, kelos via svc DNS. No ingress.
+# Secret `mailbox-secrets` is created imperatively (see APPLY.md) — NOT committed here.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mailbox-data
+  namespace: kelos-pilot
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: auto-ebs-gp3        # real SC name read off interactive-review's PVC
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailbox-mcp
+  namespace: kelos-pilot
+  labels: { app: mailbox-mcp }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }          # RWO EBS can't attach to two pods mid-rollout
+  selector:
+    matchLabels: { app: mailbox-mcp }
+  template:
+    metadata:
+      labels: { app: mailbox-mcp }
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64        # amd64 image; cluster is amd64-majority
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000                  # oven/bun `bun` user
+        runAsGroup: 1000
+        fsGroup: 1000                    # so `bun` can write the SQLite PVC at /data
+      # Same-account ECR: EKS node IAM pulls it natively — no imagePullSecret needed.
+      containers:
+        - name: mailbox
+          image: 565715328522.dkr.ecr.us-east-1.amazonaws.com/agent-mailbox-mcp:0.3.0-amd64
+          ports: [{ containerPort: 8080, name: http }]
+          env:
+            - { name: AGENT_MAILBOX_DB, value: /data/mailbox.sqlite }
+            - { name: PORT, value: "8080" }
+            - { name: AGENT_MAILBOX_HTTP_HOST, value: 0.0.0.0 }
+          envFrom:
+            - secretRef: { name: mailbox-secrets }   # AGENT_MAILBOX_ADMIN_TOKEN + AGENT_MAILBOX_HTTP_TOKENS
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: mailbox-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailbox-mcp
+  namespace: kelos-pilot
+spec:
+  type: ClusterIP
+  selector: { app: mailbox-mcp }
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }
