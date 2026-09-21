@@ -22,7 +22,7 @@ The kelos **Task fleet** can **ask Brian a question mid-run and block for a real
   - [x] Root-caused the socket-close: `watch_updates` is a **naive silent hold, no keepalive** → idle connection ECONNRESET at ~30-60s (reproduced with the reference SDK client, not just claude-code)
   - [x] Built `ask_human` (blocks + progress-notification keepalive); reviewed wiring; image `0.2.0-amd64` pushed to ECR + relay redeployed (tool live)
   - [x] Re-probe (Task `collab-probe-2`): **KEEPALIVE WORKS** — agent made ONE blocking `ask_human` call, connection survived to **120s** (heartbeats at 30/60/90/120s) vs the old 30-60s ECONNRESET. Guide's **2-min auto-background CONFIRMED**: claude-code 2.1.263 dropped the call at exactly 120s ("transport dropped mid-call; response lost") = `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` default 120000.
-- Now: [→] **BUILD ② — the WATCHER (continuation trigger) is next.** Non-blocking tool DONE (below). See "② BUILD PLAN" under Next.
+- Now: [→] **AT THE BREAKGLASS BOUNDARY.** All local pieces DONE (async tool + watcher + probe). Next real step needs a `breakglass` ECR push of the `0.4.0` relay image (the running relay is `0.2.0`, has NO `ask_human_async`). After push+redeploy: apply `collab-probe-4`, answer as local-brian, watch continuation spawn. See "② BUILD PLAN" + "RESUME KICKOFF".
 
 - RETIRED ① (kept for reuse — the mailbox reply-visibility facts still hold): TWO independent root causes localized (re-probe `collab-probe-3` on `0.3.0`, digest IDENTICAL to `0.2.0` — debugger only added tests, Dockerfile ships `src/` not `tests/`, so relay code UNCHANGED). Both were transport-layer, hence the pivot:
 
@@ -40,9 +40,10 @@ The kelos **Task fleet** can **ask Brian a question mid-run and block for a real
 - Next — **② BUILD PLAN** (escalate-and-resume; design UNCONFIRMED until kelos trigger mechanism verified):
   - [x] **Continuation trigger DESIGN RESOLVED (linchpin verified 2026-09-21).** kelos v1alpha2 TaskSpawner `when` sources are ONLY `githubIssues`/`githubPullRequests`/`cron`/`jira` (skill `references/taskspawner.yaml`) — **NO generic webhook/gateway trigger**; pr-reviewer's `when.githubWebhook` is GitHub-shaped, not arbitrary-HTTP. So candidate (a) mailbox→kelos-webhook is DEAD. CHOSEN: a **watcher creates the continuation `Task` CRD directly** (kelos Task is a plain CRD; probe history proves on-demand `kubectl apply` works) — zero dependency on any kelos trigger feature. Watcher placement (sub-decision): **prototype with local `mb-client watch`** (Brian-in-loop, reversible), then optionally move into the relay w/ a ServiceAccount RBAC to create Tasks. NOTE: skill warns examples≠source; design deliberately avoids needing the `when` schema, so exact Go types need not be re-verified.
   - [x] **Non-blocking ask tool DONE 2026-09-21** — `ask_human_async` (`src/tools.ts`, right after retired `ask_human`): posts question, returns `{posted,question_id,thread_id,recipient_id}` instantly (no poll/keepalive/SSE hold). Task then exits. TDD'd: `tests/ask-human-async.test.ts` (3 tests) + full suite **83 pass/1 skip/0 fail, 0 regressions**. **WATCHER DATA CONTRACT** (metadata on the posted question): `event_type:"ask_human"`, `mode:"async"`, `recipient_id`, `asker_id` (=originating agent id, e.g. `kelos`), optional `resume_context` (where the run was), optional `continuation_task` (kelos resource to resume). Reply is readable via `getThread(asker_id, thread_id, workspace)` → firstHumanReply predicate (`sender!=asker && recipient==asker`).
-  - [ ] **Answer-injection**: continuation Task must receive (original context/thread_id + the human's reply body). Decide carrier: mailbox `get_thread` at startup vs. injected env/prompt.
-  - [ ] Local answerer already built: `scripts/mb-client.mjs answer <n>` (finds question, replies) + `getthread`.
-  - [ ] Wire into a real TaskSpawner (candidate: `inpulse-pr-reviewer`) once the trigger loop is proven on a probe.
+  - [x] **WATCHER DONE 2026-09-21** — `scripts/mb-resume-watcher.mjs` (I/O shell) + `scripts/lib/continuation.mjs` (pure logic, 8 unit tests in `tests/continuation.test.ts`). Polls mailbox as local-brian → `decideContinuation` (answered && !alreadySpawned) → builds continuation `Task` as JSON (injection-safe; answer+resume_context in prompt) → `kubectl apply`. **Idempotent 2 ways:** in-thread `continuation_spawned` marker (survives restart) + deterministic Task name (`resume-<qid>`). Answer injected via the continuation prompt ("RESUMED WITH ANSWER: <n>"). **Live dry-run PASSED** against the running relay (connects, polls, "no async questions pending"). `--dry-run`/`--once` flags for safe probing. Full suite **91 pass/1 skip/0 fail**.
+  - [x] **② HITL probe ready**: `deploy/kelos-pilot/probe-task-async.yaml` (`collab-probe-4`) — asks via `ask_human_async` + exits (needs relay `0.4.0`).
+  - [x] Local answerer: `scripts/mb-client.mjs answer <n>` (finds question, replies) + `getthread`.
+  - [ ] **⚠ WIRING DECISION (2026-09-21):** `inpulse-pr-reviewer` is explicitly UNATTENDED — its prompt's first line is "nobody can answer a question; prefer doing nothing". Wiring `ask_human_async` into it CONTRADICTS that safety contract (and it's another workstream's live resource). **DECISION: prove on the dedicated `collab-probe-4` FIRST** (chosen over direct-wire and over a clone). Revisit real-spawner wiring (probe-first proven, then maybe a separate `-hitl` clone) only after the loop works.
   - [ ] Reusable substrate already live & tested (82-pass): mailbox plumbing, `src/request-context.ts`, deploy manifests, ECR image, 2 planes online.
 
 ## Open Questions (UNCONFIRMED)
@@ -50,7 +51,7 @@ The kelos **Task fleet** can **ask Brian a question mid-run and block for a real
 - UNCONFIRMED: exact claude-code MCP timeout env var names/defaults (guide's numbers unverified).
 
 ## Working Set
-- Fork/clone: `~/source/agent-mailbox-mcp` @ upstream `f54511d` + **UNCOMMITTED** local changes (persist on disk, not in git history — consider committing first via `Skill("commit")`):
+- Fork/clone: `~/source/agent-mailbox-mcp` @ upstream `f54511d`. **COMMITTED 2026-09-21** on branch `feat/kelos-hitl-mailbox-bridge` (3 commits: tools 857c043 / deploy e3a9cc6 / docs 4bfe010) and **pushed to the `brumschlag` fork** (`github.com/brumschlag/agent-mailbox-mcp`, remote `brumschlag`; upstream `origin`=Kipachu-1 untouched, no push access). Files:
   - modified: `Dockerfile` (USER bun, PORT=8080), `src/mcp.ts` (ALS wiring), `src/tools.ts` (ask_human + firstHumanReply)
   - new: `src/request-context.ts`, `tests/ask-human.test.ts` (82-pass suite), `deploy/`, `scripts/`, `thoughts/`
 - Manifests: `deploy/kelos-pilot/{relay.yaml(img 0.3.0),kelos-collab.yaml,probe-task.yaml(collab-probe-3+anti-cap env),APPLY.md}`
@@ -60,9 +61,12 @@ The kelos **Task fleet** can **ask Brian a question mid-run and block for a real
 - LIVE in kelos-pilot: `deploy/mailbox-mcp` 1/1 (running 0.2.0==0.3.0 code); `session/inpulse-collab` Suspended; tasks `collab-probe-2/-3` Succeeded (ttl-clean ~1h). Secrets `mailbox-secrets`, `collab-bridge-headers`, PVC `mailbox-data`.
 - beads: home DB schema-blocked (v11 vs v19) — do NOT auto-migrate; tracking here instead
 
-## RESUME KICKOFF (next session)
-1. Read this ledger. Optionally `Skill("commit")` the uncommitted fork changes first (safety).
-2. **Decide ① vs ②** (see ARCHITECTURE RECONSIDER above) — ② (escalate-and-resume) likely more robust; if staying on ①, continue below.
-3. **Confirm CAUSE 1 mechanism (B stale-read vs C unflushed-response):** add a server-side log line where `ask_human` returns; redeploy; re-probe (`collab-probe-4`), reply at +30s, read mailbox-pod logs to see if the handler detected+returned. B → fix store connection/txn; C → fix SSE response flush.
-4. **CAUSE 2:** find the real claude-code var for the 120s drop (`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` had no effect) or treat 120s as a hard ceiling (favors ②).
-5. Re-probe loop: `kubectl --context <ctx> apply -f deploy/kelos-pilot/probe-task.yaml` → wait → `MB_TOKEN=$(cat ~/.mailbox-local-token) MB_URL=http://127.0.0.1:8137/mcp bun scripts/mb-client.mjs answer 4` (needs a port-forward) → expect `GOT REPLY: 4`.
+## RESUME KICKOFF (next session) — ② GO-LIVE (breakglass gated)
+Decision ② is LOCKED; async tool + watcher + probe are BUILT, tested, committed & pushed to the `brumschlag` fork. Only the ECR push needs breakglass. Sequence:
+1. **[USER] breakglass login:** `aws sso login --profile breakglass` (default `TellihealthBedrockDeveloper` is denied `ecr:GetAuthorizationToken`).
+2. **[build+push relay `0.4.0`]** (adds `ask_human_async`): `DOCKER_CONFIG=$(mktemp -d)` (WSL cred-store bug) → `aws ecr get-login-password --profile breakglass --region us-east-1 | docker login --username AWS --password-stdin 565715328522.dkr.ecr.us-east-1.amazonaws.com` → `docker buildx build --platform linux/amd64 -t …/agent-mailbox-mcp:0.4.0-amd64 --push .` (amd64 for the cluster; ECR tags immutable — 0.4.0 is a fresh tag).
+3. **[redeploy]** `kubectl --context <ctx> -n kelos-pilot apply -f deploy/kelos-pilot/relay.yaml` (already pinned 0.4.0) → `rollout status` → confirm `ask_human_async` in the tool list.
+4. **[probe]** port-forward `svc/mailbox-mcp 8137:8080`; `kubectl --context <ctx> apply -f deploy/kelos-pilot/probe-task-async.yaml` → Task posts question via `ask_human_async` + exits (prints `ASKED: <qid>`).
+5. **[watch + answer]** in one shell run the watcher: `MB_TOKEN=$(cat ~/.mailbox-local-token) MB_URL=http://127.0.0.1:8137/mcp KELOS_CONTEXT=<ctx> bun scripts/mb-resume-watcher.mjs --dry-run` (see the manifest), then real (no `--dry-run`); in another, answer: `… bun scripts/mb-client.mjs answer 4`. Watcher spawns `resume-<qid>` → check its logs for **`RESUMED WITH ANSWER: 4`** = ② loop proven end-to-end.
+6. **Then** revisit real-spawner wiring (a separate `-hitl` clone, NOT mutating the unattended `inpulse-pr-reviewer`).
+⚠ Always `kubectl --context <ctx> …` (shared kubeconfig) — never `use-context`.
