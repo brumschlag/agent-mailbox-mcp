@@ -6,13 +6,14 @@ import {
   type ArtifactStorage,
 } from "./artifact-storage";
 import type { AgentConfig } from "./config";
+import { currentMcpRequestContext } from "./request-context";
 import {
   buildNextActions,
   buildSessionSummary,
   coordinationConventions,
   recommendedSessionSteps,
 } from "./session";
-import { LocalCommsStore, type TaskStatus } from "./store";
+import { LocalCommsStore, type MessageRecord, type TaskStatus } from "./store";
 
 const metadataSchema = z.record(z.string(), z.unknown()).optional();
 const workspaceSchema = z.string().min(1).optional();
@@ -438,6 +439,144 @@ export function createCommunicationTools(
           updates = await store.updatesSince(agent.id, input.workspace ?? agent.workspace, input.since);
         }
         return json({ updates });
+      },
+    }),
+    communicationTool({
+      name: "ask_human",
+      description:
+        "Ask a human a question and BLOCK until they reply, then return the reply. Posts the question as a direct message to a human recipient (default 'local-brian'), then long-polls the mailbox for the human's reply in the same thread, up to timeout_ms (default 5 minutes, max 10 minutes). The call keeps its connection alive during the wait by emitting periodic progress notifications, so a multi-minute wait does not drop. Returns answered=false with no reply if the timeout elapses first; the human can still reply later and you can re-check the thread. Use this for human-in-the-loop approvals, clarifying questions, or decisions only a human can make.",
+      inputSchema: z.object({
+        workspace: workspaceSchema,
+        question: z.string().min(1),
+        recipient_id: z.string().min(1).optional(),
+        timeout_ms: z.number().int().min(0).max(600_000).optional(),
+        poll_interval_ms: z.number().int().min(100).max(60_000).optional(),
+      }),
+      handler: async (input) => {
+        const workspace = input.workspace ?? agent.workspace;
+        const recipientId = input.recipient_id ?? "local-brian";
+        const timeoutMs = input.timeout_ms ?? 300_000;
+        const pollIntervalMs = input.poll_interval_ms ?? 2_000;
+        const keepaliveIntervalMs = 10_000;
+
+        // Post the question as a direct message. Its own id seeds the thread,
+        // so a human reply (reply_message / send_message with reply_to or
+        // thread_id) lands in the same thread addressed back to this agent.
+        const question = await store.sendMessage({
+          senderId: agent.id,
+          workspace,
+          recipientId,
+          body: input.question,
+          metadata: { event_type: "ask_human", recipient_id: recipientId },
+        });
+        const questionId = question.id;
+        const threadId = question.thread_id;
+
+        const ctx = currentMcpRequestContext();
+        let keepaliveCount = 0;
+        const emitKeepalive = async (): Promise<void> => {
+          if (!ctx?.sendNotification || ctx.signal?.aborted) {
+            return;
+          }
+          keepaliveCount += 1;
+          try {
+            await ctx.sendNotification({
+              method: "notifications/progress",
+              params: {
+                // Prefer the client's own progress token so the client
+                // associates and displays the update; fall back to a synthetic
+                // token purely so the notification (and thus keepalive bytes)
+                // still flows when the caller did not request progress.
+                progressToken: ctx.progressToken ?? `ask_human:${questionId}`,
+                progress: keepaliveCount,
+                message: `Waiting for ${recipientId} to reply to ask_human…`,
+              },
+            });
+          } catch {
+            // A keepalive failure (e.g. connection already gone) must not fail
+            // the tool; the poll loop will observe the aborted signal / timeout.
+          }
+        };
+
+        const findReply = async (): Promise<MessageRecord | null> =>
+          firstHumanReply(
+            await store.getThread(agent.id, threadId, workspace, 200, 0),
+            agent.id,
+            questionId,
+          );
+
+        // Emit an initial keepalive immediately so the first byte reaches the
+        // client well before any idle-timeout window, then poll.
+        await emitKeepalive();
+        let lastKeepalive = Date.now();
+        const deadline = Date.now() + timeoutMs;
+
+        let reply = await findReply();
+        while (!reply && Date.now() < deadline) {
+          if (ctx?.signal?.aborted) {
+            break;
+          }
+          if (Date.now() - lastKeepalive >= keepaliveIntervalMs) {
+            await emitKeepalive();
+            lastKeepalive = Date.now();
+          }
+          const untilKeepalive = lastKeepalive + keepaliveIntervalMs - Date.now();
+          const untilDeadline = deadline - Date.now();
+          const waitMs = Math.max(0, Math.min(pollIntervalMs, untilKeepalive, untilDeadline));
+          await sleep(waitMs);
+          reply = await findReply();
+        }
+
+        return json({
+          answered: Boolean(reply),
+          question_id: questionId,
+          keepalives_sent: keepaliveCount,
+          reply: reply
+            ? { message_id: reply.id, sender_id: reply.sender_id, body: reply.body }
+            : undefined,
+        });
+      },
+    }),
+    communicationTool({
+      name: "ask_human_async",
+      description:
+        "Ask a human a question WITHOUT blocking, then finish your run. Posts the question as a direct message to a human recipient (default 'local-brian') and returns IMMEDIATELY with question_id + thread_id — it does NOT wait for a reply. This is the escalate-and-resume pattern (architecture ②): post the question, exit your run, and a watcher spawns a continuation run carrying the human's answer once they reply. Prefer this over any long blocking wait — a single MCP tool call cannot be held open past ~120s in a headless run, so blocking for a human is unreliable. Pass resume_context to describe where you were, and continuation_task to name the kelos resource the watcher should resume.",
+      inputSchema: z.object({
+        workspace: workspaceSchema,
+        question: z.string().min(1),
+        recipient_id: z.string().min(1).optional(),
+        resume_context: z.string().min(1).optional(),
+        continuation_task: z.string().min(1).optional(),
+      }),
+      handler: async (input) => {
+        const workspace = input.workspace ?? agent.workspace;
+        const recipientId = input.recipient_id ?? "local-brian";
+        // Post the question as a direct message. Its own id seeds the thread so
+        // a later human reply (reply_message / send_message with reply_to or
+        // thread_id) lands in the same thread addressed back to this agent, and
+        // the asker — or a continuation run acting as the asker — can read it
+        // via get_thread. No poll loop: the call returns at once and the run
+        // exits; a watcher resumes work when the reply arrives (architecture ②).
+        const question = await store.sendMessage({
+          senderId: agent.id,
+          workspace,
+          recipientId,
+          body: input.question,
+          metadata: {
+            event_type: "ask_human",
+            mode: "async",
+            recipient_id: recipientId,
+            asker_id: agent.id,
+            ...(input.resume_context ? { resume_context: input.resume_context } : {}),
+            ...(input.continuation_task ? { continuation_task: input.continuation_task } : {}),
+          },
+        });
+        return json({
+          posted: true,
+          question_id: question.id,
+          thread_id: question.thread_id,
+          recipient_id: recipientId,
+        });
       },
     }),
     communicationTool({
@@ -1093,6 +1232,29 @@ function hasUpdates(updates: {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Given the messages of an ask_human thread (chronological, oldest-first),
+ * return the earliest message that qualifies as the human's reply: authored by
+ * someone other than the asking agent, and either addressed back to the asking
+ * agent or an explicit reply to the question message. Returns null when only the
+ * question itself (or unrelated traffic) is present.
+ */
+function firstHumanReply(
+  threadMessages: MessageRecord[],
+  askingAgentId: string,
+  questionId: string,
+): MessageRecord | null {
+  return (
+    threadMessages.find(
+      (message) =>
+        message.id !== questionId &&
+        message.sender_id !== askingAgentId &&
+        (message.recipient_id === askingAgentId ||
+          message.reply_to_message_id === questionId),
+    ) ?? null
+  );
 }
 
 function workspaceName(workspace: string | undefined): string {

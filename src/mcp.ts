@@ -7,8 +7,19 @@ import type { AnyTool, JSONToolOutput } from "beeai-framework/tools/base";
 import type { z } from "zod";
 import type { ArtifactStorage } from "./artifact-storage";
 import type { AgentConfig } from "./config";
+import { mcpRequestContext, type ProgressNotification } from "./request-context";
 import { LocalCommsStore } from "./store";
 import { createCommunicationTools } from "./tools";
+
+/**
+ * The subset of the MCP SDK's `RequestHandlerExtra` that we forward to tool
+ * handlers. Typed structurally so we don't couple to the SDK's generic shape.
+ */
+interface McpToolCallExtra {
+  sendNotification?: (notification: ProgressNotification) => Promise<void>;
+  _meta?: { progressToken?: string | number };
+  signal?: AbortSignal;
+}
 
 type BeeAiToolRegistrar = (
   name: string,
@@ -17,7 +28,7 @@ type BeeAiToolRegistrar = (
     description?: string;
     inputSchema?: z.ZodTypeAny;
   },
-  callback: (input: unknown) => Promise<CallToolResult>,
+  callback: (input: unknown, extra?: McpToolCallExtra) => Promise<CallToolResult>,
 ) => unknown;
 
 export function createLocalCommsMcpServer(
@@ -55,29 +66,48 @@ export function registerBeeAiTools(server: McpServer, tools: AnyTool[]): void {
   const registerTool = server.registerTool.bind(server) as BeeAiToolRegistrar;
   for (const tool of tools) {
     const inputSchema = tool.inputSchema() as z.ZodTypeAny;
-    const callback = async (input: unknown): Promise<CallToolResult> => {
-      try {
-        const output = (await tool.run(input)) as JSONToolOutput<unknown>;
-        return {
-          structuredContent: output.result as Record<string, unknown>,
-          content: [
-            {
-              type: "text",
-              text: output.getTextContent(),
-            },
-          ],
-        };
-      } catch (error) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: errorMessage(error),
-            },
-          ],
-        };
-      }
+    const callback = async (
+      input: unknown,
+      extra?: McpToolCallExtra,
+    ): Promise<CallToolResult> => {
+      // Expose per-request MCP capabilities (progress notifications, the client
+      // progress token, and the abort signal) to the tool handler via
+      // AsyncLocalStorage. beeai's DynamicTool handler signature does not
+      // forward the MCP `extra`, so a blocking tool (ask_human) reads it from
+      // this scope to emit keepalive bytes on the held-open response stream.
+      return mcpRequestContext.run(
+        {
+          sendNotification: extra?.sendNotification
+            ? (notification) => extra.sendNotification!(notification)
+            : undefined,
+          progressToken: extra?._meta?.progressToken,
+          signal: extra?.signal,
+        },
+        async () => {
+          try {
+            const output = (await tool.run(input)) as JSONToolOutput<unknown>;
+            return {
+              structuredContent: output.result as Record<string, unknown>,
+              content: [
+                {
+                  type: "text",
+                  text: output.getTextContent(),
+                },
+              ],
+            };
+          } catch (error) {
+            return {
+              isError: true,
+              content: [
+                {
+                  type: "text",
+                  text: errorMessage(error),
+                },
+              ],
+            };
+          }
+        },
+      );
     };
     registerTool(
       tool.name,
