@@ -39,7 +39,7 @@ spec:
       # Same-account ECR: EKS node IAM pulls it natively — no imagePullSecret needed.
       containers:
         - name: mailbox
-          image: 565715328522.dkr.ecr.us-east-1.amazonaws.com/agent-mailbox-mcp:0.3.0-amd64
+          image: 565715328522.dkr.ecr.us-east-1.amazonaws.com/agent-mailbox-mcp:0.4.0-amd64
           ports: [{ containerPort: 8080, name: http }]
           env:
             - { name: AGENT_MAILBOX_DB, value: /data/mailbox.sqlite }

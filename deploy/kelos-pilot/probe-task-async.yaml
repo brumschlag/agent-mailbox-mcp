@@ -1,0 +1,47 @@
+# HITL escalate-and-resume probe (architecture ②).
+# The Task asks a question via ask_human_async and EXITS immediately — no blocking
+# call, no 120s ceiling. The local resume-watcher (scripts/mb-resume-watcher.mjs)
+# detects the human's reply and spawns a continuation Task carrying the answer,
+# which prints "RESUMED WITH ANSWER: <n>". Proves the loop WITHOUT touching the
+# unattended inpulse-pr-reviewer contract.
+#
+# Requires relay image >= 0.4.0-amd64 (the one that ships ask_human_async).
+apiVersion: kelos.dev/v1alpha2
+kind: Task
+metadata:
+  name: collab-probe-4
+  namespace: kelos-pilot
+spec:
+  type: claude-code
+  model: claude-sonnet-46
+  credentials: { type: none }
+  workspaceRef: { name: envoverrides-scratch }   # lightweight; the probe touches no repo
+  agentConfigRefs:
+    - { name: collab-bridge }
+  ttlSecondsAfterFinished: 3600
+  prompt: |
+    HUMAN-IN-THE-LOOP ESCALATE-AND-RESUME PROBE (architecture ②).
+    Do NOT modify any repository files. Use the `agent-mailbox` MCP tools, workspace "inpulse".
+    1. Call session_start.
+    2. Call ask_human_async with:
+         question: "PROBE ②: what is 2+2? Reply with just the number."
+         recipient_id: "local-brian"
+         resume_context: "collab-probe-4: verifying escalate-and-resume; expected answer is a single number."
+         continuation_task: "collab-probe-4"
+       This posts the question and returns IMMEDIATELY — it does NOT block or wait.
+    3. Print exactly "ASKED: <question_id>" using the returned question_id, then FINISH.
+    Do NOT wait or poll for a reply — your run ends here. A watcher spawns a
+    continuation run once the human answers.
+  podOverrides:
+    nodeSelector:
+      kubernetes.io/arch: amd64
+    env:
+      - name: ANTHROPIC_BASE_URL
+        value: http://bedrock-gateway.honcho.svc.cluster.local
+      - name: ANTHROPIC_AUTH_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: honcho-gateway-key
+            key: gateway-api-key
+      - name: MAX_THINKING_TOKENS
+        value: "0"
